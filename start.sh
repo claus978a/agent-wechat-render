@@ -32,6 +32,19 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
+# Reply bot (bot.js): polls the daemon on loopback and answers the group
+# via SiliconFlow. Needs SILICONFLOW_API_KEY in the environment; if it is
+# missing the bot stays up and logs a warning instead of crashing.
+(
+  while true; do
+    echo "[start] launching bot.js ..."
+    node /app/bot.js
+    echo "[start] bot exited (code $?), restarting in 5s ..."
+    sleep 5
+  done
+) &
+BOT_LOOP_PID=$!
+
 # Proxy in the foreground: this is the container's main process.
 # If the proxy dies, Render restarts the container (and the daemon with it).
 exec node /app/proxy.js

@@ -12,7 +12,8 @@
 |---|---|
 | `Dockerfile` | 部署用的镜像：Node 24 + ffmpeg + agent-wechat v2.2.0（官方二进制，SHA256 校验过） |
 | `proxy.js` | 网页入口：Render 要求服务监听 `0.0.0.0:$PORT`，但 daemon 只肯监听本机（127.0.0.1），所以由它对外提供网页——`/health`（健康检查）、`/connectivity`（连通性测试）、`/login`（扫码登录页）、`/`（操作页：看群聊、发消息）。它只暴露这几个安全接口，daemon 的原始 API（要 token）不对外开放 |
-| `start.sh` | 启动脚本：先起 daemon（本机 6174 端口），再起 proxy（对外 $PORT） |
+| `bot.js` | （v5 新增）群里自动回消息的机器人：每秒轮询本机 daemon，收到新消息就调 SiliconFlow（免费模型）生成中文回复，图片消息会下载下来用视觉模型看一眼再回。只回群 `45570455225@chatroom` 的消息 |
+| `start.sh` | 启动脚本：先起 daemon（本机 6174 端口），再起 bot.js（后台自动回复），最后起 proxy（对外 $PORT） |
 | `package.json` | 只是说明文件（Render 用 Dockerfile 部署，不靠它） |
 | `render.yaml` | 可选：Render Blueprint，一键建服务用的 |
 | `watch.sh` | 只能在 Shell 里用，免费版没有 Shell，所以这个文件用不上，留着不用管 |
@@ -119,6 +120,21 @@ Render 免费版 15 分钟没人访问会自动睡觉，睡了微信就断连。
 | 容器重启后要重新登录 | 正常现象（免费版没硬盘）。去 `/login` 重新扫码就行 |
 | 登录时二维码扫出来是网页 | 用微信里的扫一扫，别用手机相机；手机要登着小号光谱；点“重新获取二维码”换个新码再扫 |
 | 部署失败（Deploy failed） | 先确认仓库根目录直接有 `Dockerfile`（别包在文件夹里）；再确认 Render 里 Runtime 选的是 `Docker` 不是 `Node`；还不行就把部署日志（Logs）截图发我 |
+
+## v5：机器人自动回消息（SiliconFlow 免费模型）
+
+以前群里的回复是靠另一台服务器每 1.5 秒远程轮询 Render，慢（10–20 秒）还经常断。v5 把回复逻辑搬进了 Render 容器里：`bot.js` 直接在本机轮询 daemon，收到消息就调 SiliconFlow 的免费模型生成回复，文字消息大概 2–3 秒就能回。
+
+**设置密钥（部署前必须做）：**
+1. 去 https://cloud.siliconflow.cn 注册登录，左边找到 **API 密钥**，新建一个，复制 `sk-...` 开头的密钥。
+2. 在 Render 里打开这个服务 → 左边 **Environment** → 点 **Add Environment Variable**，Key 填 `SILICONFLOW_API_KEY`，Value 粘贴密钥，保存。
+3. 再重新部署（`Manual Deploy` → `Deploy latest commit`）。**重新部署会清掉微信登录，部署完去 `/login` 重新扫码。**
+
+**用的模型（都是免费的，可以在 Environment 里改）：**
+- 文字：`Qwen/Qwen2.5-7B-Instruct`（环境变量 `SILICONFLOW_MODEL`）
+- 看图：`Qwen/Qwen2-VL-7B-Instruct`（环境变量 `SILICONFLOW_VISION_MODEL`，失败时自动换 `Qwen/Qwen2.5-VL-7B-Instruct`）
+
+**注意：** 部署 v5 之后，以前那台服务器上的轮询程序要停掉，不然群里会收到两份回复（一个 Render 发的，一个旧程序发的）。只留 Render 里的 bot.js 回消息。
 
 ## 费用
 

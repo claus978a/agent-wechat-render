@@ -30,9 +30,10 @@ RUN npm install -g --allow-scripts=@agent-wechat/cli @agent-wechat/cli@${WX_VERS
     && wx --json version
 
 WORKDIR /app
-COPY package.json proxy.js start.sh ./
+COPY package.json proxy.js bot.js start.sh ./
 RUN chmod +x start.sh \
-    && node --check proxy.js
+    && node --check proxy.js \
+    && node --check bot.js
 
 # Render sets $PORT at runtime; EXPOSE is documentary.
 EXPOSE 10000

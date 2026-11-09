@@ -12,3 +12,7 @@ services:
     envVars:
       - key: DAEMON_PORT
         value: "6174"
+      # Fast-reply bot (bot.js) reads this. Set the real key in the Render
+      # Dashboard (Environment) — never commit it to the repo.
+      - key: SILICONFLOW_API_KEY
+        sync: false
