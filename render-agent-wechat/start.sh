@@ -6,12 +6,11 @@ set -u
 
 export AGENT_WECHAT_NATIVE_BINARY="${AGENT_WECHAT_NATIVE_BINARY:-/opt/agent-wechat/wx}"
 DAEMON_PORT="${DAEMON_PORT:-6174}"
-# Optional: override the daemon data dir (default: ~/.local/share/agent-wechat).
-# Set AGENT_WECHAT_DATA_DIR to test without touching the real profile.
-DATA_DIR_ARGS=()
-if [ -n "${AGENT_WECHAT_DATA_DIR:-}" ]; then
-  DATA_DIR_ARGS=(--data-dir "$AGENT_WECHAT_DATA_DIR")
-fi
+# Data dir: default is ~/.local/share/agent-wechat. Pin it explicitly so
+# the daemon and the proxy (which reads the owner token from the same dir)
+# always agree, even if HOME differs between processes.
+export AGENT_WECHAT_DATA_DIR="${AGENT_WECHAT_DATA_DIR:-$HOME/.local/share/agent-wechat}"
+DATA_DIR_ARGS=(--data-dir "$AGENT_WECHAT_DATA_DIR")
 
 # Keep the daemon alive: restart it if it ever exits.
 (
