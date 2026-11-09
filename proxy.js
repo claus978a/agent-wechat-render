@@ -30,6 +30,15 @@
 //                          transfer, polls the job, then retries. Returns
 //                          {ok:false, error} when the picture is expired
 //                          or cannot be fetched. (v4)
+//   GET  /api/video?messageId=<id>
+//                          -> download a video a group member sent:
+//                          JSON {ok, videoBase64, mimeType, byteLength}.
+//                          No /messages/{id}/video shortcut exists, so
+//                          this lists the message's attachments, picks
+//                          the video playback copy (variant "normal"),
+//                          downloads it via a media transfer when not
+//                          cached, then returns the cached bytes.
+//                          Max 30 MB; transfer poll up to 120s. (v7)
 //   anything else      -> 404
 //
 // Auth: the proxy reads the daemon's owner token from its data dir
@@ -199,8 +208,14 @@ async function daemonGetMessageImage(accountId, messageId, quality) {
   try { const j = JSON.parse(r.body.toString('utf8')); if (j.error && j.error.code) code = j.error.code; } catch { /* ignore */ }
   return { ok: false, status: r.status || 0, error: code };
 }
-async function daemonStartMediaTransfer(accountId, messageId, quality) {
-  const r = await daemonJson('POST', `/v1/accounts/${accountId}/messages/${encodeURIComponent(messageId)}/media-transfers`, { message_id: messageId, quality: quality || 'best' });
+async function daemonStartMediaTransfer(accountId, messageId, quality, assetId) {
+  // NOTE: the wire format is camelCase (messageId/assetId/quality) —
+  // snake_case message_id is rejected with 422 invalid_request. (v7 fix:
+  // the v4 image-transfer call used message_id and could never work; the
+  // image fast path masked it.)
+  const body = { messageId, quality: quality || 'best' };
+  if (assetId) body.assetId = assetId;
+  const r = await daemonJson('POST', `/v1/accounts/${accountId}/messages/${encodeURIComponent(messageId)}/media-transfers`, body);
   if (r.ok && r.data && r.data.id) return { ok: true, jobId: r.data.id };
   return { ok: false, status: r.status, error: (r.data && r.data.error && r.data.error.code) || r.error || 'transfer-failed' };
 }
@@ -229,6 +244,82 @@ async function fetchMessageImage(accountId, messageId, quality) {
   const done = await daemonPollJob(accountId, t.jobId, 60000);
   if (!done.ok) return { ok: false, error: done.error || 'download-failed' };
   return daemonGetMessageImage(accountId, messageId, q);
+}
+
+// ------------------------------------------------- incoming video (v7)
+// There is NO /messages/{id}/video shortcut (verified: the route does
+// not exist in v2.2.0 — binary strings + route table + live probe). A
+// video message (type 43) is downloaded through the generic media flow:
+//   GET  /v1/accounts/{a}/messages/{id}/media -> {"items":[MediaAsset]}
+//        (each asset: id, kind=image|file|video|voice|sticker,
+//         variant=best|thumbnail|standard|original|normal|encoded,
+//         state=pending|available|expired|unsupported, content_type,
+//         byte_length, advertised_byte_length, expires_at, ...)
+//   POST /v1/accounts/{a}/messages/{id}/media-transfers
+//        {messageId, assetId?, quality} -> 202 MediaJob
+//   GET  /v1/accounts/{a}/jobs/{id} -> poll until completed/failed
+//   GET  /v1/accounts/{a}/media/{assetId}/content -> raw bytes (any type)
+// Videos are NOT auto-downloaded on receipt (unlike images), so the
+// transfer path is the primary one here. The playback copy is variant
+// "normal"; thumbnails are separate assets and must be skipped.
+async function daemonListMessageMedia(accountId, messageId) {
+  const r = await daemonJson('GET', `/v1/accounts/${accountId}/messages/${encodeURIComponent(messageId)}/media`);
+  if (r.ok && r.data && Array.isArray(r.data.items)) return { ok: true, items: r.data.items };
+  return { ok: false, status: r.status, error: (r.data && r.data.error && r.data.error.code) || r.error || 'media-list-failed' };
+}
+function pickVideoAsset(items) {
+  if (!Array.isArray(items)) return null;
+  const videos = items.filter((a) => a && a.kind === 'video' && a.variant !== 'thumbnail');
+  if (!videos.length) return null;
+  return videos.find((a) => a.variant === 'normal')
+    || videos.find((a) => a.variant === 'original')
+    || videos.find((a) => a.variant === 'best')
+    || videos[0];
+}
+async function daemonGetMediaContent(accountId, assetId) {
+  const r = await daemonCall('GET', `/v1/accounts/${accountId}/media/${encodeURIComponent(assetId)}/content`, undefined, undefined, 120000);
+  if (r.status === 200 && r.body && r.body.length > 0) {
+    const mimeType = (r.headers && r.headers['content-type']) || 'video/mp4';
+    return { ok: true, buf: r.body, mimeType: String(mimeType).split(';')[0].trim() };
+  }
+  let code = 'content-unavailable';
+  try { const j = JSON.parse(r.body.toString('utf8')); if (j.error && j.error.code) code = j.error.code; } catch { /* ignore */ }
+  return { ok: false, status: r.status || 0, error: code };
+}
+const VIDEO_MAX_BYTES = 30 * 1024 * 1024; // 30 MB cap for /api/video
+// Download one video message. Returns {ok, buf, mimeType} or {ok:false, error}.
+async function fetchMessageVideo(accountId, messageId) {
+  // 1. List attachments, pick the video playback copy.
+  const list = await daemonListMessageMedia(accountId, messageId);
+  let asset = list.ok ? pickVideoAsset(list.items) : null;
+  if (asset && (asset.state === 'expired' || asset.state === 'unsupported')) {
+    return { ok: false, error: asset.state === 'expired' ? 'media-expired' : 'media-unsupported' };
+  }
+  // 2. Already cached? Fetch the bytes directly.
+  if (asset && asset.state === 'available') {
+    const c = await daemonGetMediaContent(accountId, asset.id);
+    if (c.ok) {
+      if (c.buf.length > VIDEO_MAX_BYTES) return { ok: false, error: 'video-too-large' };
+      return { ok: true, buf: c.buf, mimeType: c.mimeType };
+    }
+    // Content fetch failed despite "available": fall through to a transfer.
+  }
+  // 3. Start a transfer (pinned to the picked asset when known) and poll.
+  //    Videos take longer than images: poll up to 120s.
+  const t = await daemonStartMediaTransfer(accountId, messageId, (asset && asset.variant) || 'best', asset ? asset.id : undefined);
+  if (!t.ok) return { ok: false, error: t.error || 'transfer-failed', status: t.status };
+  const done = await daemonPollJob(accountId, t.jobId, 120000);
+  if (!done.ok) return { ok: false, error: done.error || 'download-failed' };
+  // 4. After the job completes, re-list if we had no asset id, then fetch.
+  if (!asset) {
+    const list2 = await daemonListMessageMedia(accountId, messageId);
+    asset = list2.ok ? pickVideoAsset(list2.items) : null;
+    if (!asset) return { ok: false, error: 'no-video-asset' };
+  }
+  const c2 = await daemonGetMediaContent(accountId, asset.id);
+  if (!c2.ok) return { ok: false, error: c2.error || 'content-unavailable', status: c2.status };
+  if (c2.buf.length > VIDEO_MAX_BYTES) return { ok: false, error: 'video-too-large' };
+  return { ok: true, buf: c2.buf, mimeType: c2.mimeType };
 }
 
 // ------------------------------------------------------------- account
@@ -561,6 +652,26 @@ const server = http.createServer(async (req, res) => {
     if (!img.ok) { sendJson(res, 502, { ok: false, error: img.error || 'media-unavailable', status: img.status }); return; }
     if (img.buf.length > 10 * 1024 * 1024) { sendJson(res, 502, { ok: false, error: 'image-too-large' }); return; }
     sendJson(res, 200, { ok: true, imageBase64: img.buf.toString('base64'), mimeType: img.mimeType, quality: img.quality, byteLength: img.buf.length });
+    return;
+  }
+
+  // Download a video a group member sent: GET /api/video?messageId=<id>.
+  // Returns JSON {ok:true, videoBase64, mimeType, byteLength} (base64 so
+  // any client can use it without handling binary bodies), or
+  // {ok:false, error}. The daemon has no /messages/{id}/video shortcut,
+  // so this uses the generic media flow: list the message's attachments,
+  // pick the video playback copy (variant "normal"), download it via a
+  // media transfer when it is not cached yet, then return the cached
+  // bytes. Max 30 MB; videos take longer than images (transfer poll up
+  // to 120s). The message id is the opaque id from /api/messages.
+  if (p === '/api/video' && req.method === 'GET') {
+    const messageId = url.searchParams.get('messageId') || url.searchParams.get('id');
+    if (!messageId) { sendJson(res, 400, { ok: false, error: 'messageId-required' }); return; }
+    const accountId = await getOrCreateAccount();
+    if (!accountId) { sendJson(res, 500, { ok: false, error: 'no-account' }); return; }
+    const vid = await fetchMessageVideo(accountId, messageId);
+    if (!vid.ok) { sendJson(res, 502, { ok: false, error: vid.error || 'video-unavailable', status: vid.status }); return; }
+    sendJson(res, 200, { ok: true, videoBase64: vid.buf.toString('base64'), mimeType: vid.mimeType, byteLength: vid.buf.length });
     return;
   }
 
