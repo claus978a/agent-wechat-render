@@ -21,6 +21,15 @@
 //   POST /api/send-image -> send an image {threadId, imageBase64,
 //                          filename?, mimeType?} (JSON body, base64 JPEG/PNG,
 //                          max 10 MB; uploads to the daemon then sends it)
+//   GET  /api/media?messageId=<id>&quality=<best|original|standard|thumbnail>
+//                          -> download an image a group member sent:
+//                          JSON {ok, imageBase64, mimeType, quality}.
+//                          Uses the daemon's media API: first tries the
+//                          saved image (GET /v1/.../messages/{id}/image);
+//                          if the copy is not saved yet, starts a media
+//                          transfer, polls the job, then retries. Returns
+//                          {ok:false, error} when the picture is expired
+//                          or cannot be fetched. (v4)
 //   anything else      -> 404
 //
 // Auth: the proxy reads the daemon's owner token from its data dir
@@ -85,14 +94,14 @@ function readToken() {
 }
 
 // ------------------------------------------------------- daemon client
-function daemonCall(method, reqPath, body, extraHeaders) {
+function daemonCall(method, reqPath, body, extraHeaders, timeoutMs) {
   return new Promise((resolve) => {
     const token = readToken();
     if (!token) { resolve({ status: 0, body: null, error: 'no-daemon-token' }); return; }
     const payload = body === undefined ? null : JSON.stringify(body);
     const headers = { Authorization: `Bearer ${token}`, ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {}), ...(extraHeaders || {}) };
     const req = http.request(
-      { host: DAEMON_HOST, port: DAEMON_PORT, path: reqPath, method, headers, timeout: 15000 },
+      { host: DAEMON_HOST, port: DAEMON_PORT, path: reqPath, method, headers, timeout: timeoutMs || 15000 },
       (res) => {
         const chunks = [];
         res.on('data', (c) => chunks.push(c));
@@ -159,6 +168,67 @@ async function daemonHealth() {
     req.on('error', () => resolve(null));
     req.end();
   });
+}
+
+// ------------------------------------------------- incoming media (v4)
+// The daemon's media API (verified against the v2.2.0 binary + source):
+//   GET  /v1/accounts/{a}/messages/{id}/image?quality=best|original|standard|thumbnail
+//        -> raw image bytes (content-type image/*) when a copy is saved;
+//           409 image_quality_unavailable when the copy is not saved yet.
+//   POST /v1/accounts/{a}/messages/{id}/media-transfers
+//        body {message_id (must match the URL id), quality: "best"}
+//        -> 202 {id, state, ...} (a MediaJob). Poll GET /v1/.../jobs/{id}
+//           until state is "completed" (then retry the image endpoint) or
+//           "failed"/"cancelled".
+//   GET  /v1/accounts/{a}/messages/{id}/media -> {"items":[MediaAsset,...]}
+//        (lists the attachments of a message and whether each is available).
+// The daemon auto-downloads images on receipt (up to a per-account limit),
+// so the fast path (direct image fetch) usually works and no transfer is
+// needed. The transfer path covers pictures that arrived before the bot
+// was watching or that were not auto-downloaded.
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+async function daemonGetMessageImage(accountId, messageId, quality) {
+  const q = encodeURIComponent(quality || 'best');
+  const r = await daemonCall('GET', `/v1/accounts/${accountId}/messages/${encodeURIComponent(messageId)}/image?quality=${q}`, undefined, undefined, 60000);
+  if (r.status === 200 && r.body && r.body.length > 100) {
+    const mimeType = (r.headers && r.headers['content-type']) || 'image/jpeg';
+    const servedQuality = (r.headers && r.headers['x-wechat-image-quality']) || quality || 'best';
+    return { ok: true, buf: r.body, mimeType: String(mimeType).split(';')[0].trim(), quality: servedQuality };
+  }
+  let code = 'image-unavailable';
+  try { const j = JSON.parse(r.body.toString('utf8')); if (j.error && j.error.code) code = j.error.code; } catch { /* ignore */ }
+  return { ok: false, status: r.status || 0, error: code };
+}
+async function daemonStartMediaTransfer(accountId, messageId, quality) {
+  const r = await daemonJson('POST', `/v1/accounts/${accountId}/messages/${encodeURIComponent(messageId)}/media-transfers`, { message_id: messageId, quality: quality || 'best' });
+  if (r.ok && r.data && r.data.id) return { ok: true, jobId: r.data.id };
+  return { ok: false, status: r.status, error: (r.data && r.data.error && r.data.error.code) || r.error || 'transfer-failed' };
+}
+async function daemonPollJob(accountId, jobId, timeoutMs) {
+  const deadline = Date.now() + (timeoutMs || 60000);
+  while (Date.now() < deadline) {
+    const r = await daemonJson('GET', `/v1/accounts/${accountId}/jobs/${encodeURIComponent(jobId)}`);
+    if (r.ok && r.data) {
+      const state = String(r.data.state || '');
+      if (state === 'completed') return { ok: true, job: r.data };
+      if (state === 'failed' || state === 'cancelled') return { ok: false, error: (r.data.reason || state) };
+    }
+    await sleep(2000);
+  }
+  return { ok: false, error: 'job-timeout' };
+}
+// Download one image message. Returns {ok, buf, mimeType, quality} or
+// {ok:false, error}. Tries the saved copy first, then a transfer+poll.
+async function fetchMessageImage(accountId, messageId, quality) {
+  const q = quality || 'best';
+  const first = await daemonGetMessageImage(accountId, messageId, q);
+  if (first.ok) return first;
+  // Not saved yet (or another transient failure): start a download.
+  const t = await daemonStartMediaTransfer(accountId, messageId, q);
+  if (!t.ok) return { ok: false, error: t.error || 'transfer-failed', status: t.status };
+  const done = await daemonPollJob(accountId, t.jobId, 60000);
+  if (!done.ok) return { ok: false, error: done.error || 'download-failed' };
+  return daemonGetMessageImage(accountId, messageId, q);
 }
 
 // ------------------------------------------------------------- account
@@ -471,6 +541,26 @@ const server = http.createServer(async (req, res) => {
     const r = await daemonJson('POST', `/v1/accounts/${accountId}/sends`, { threadId, kind: 'image', sourceId: up.data.id }, { 'Idempotency-Key': key });
     if (r.ok) sendJson(res, 200, { ok: true, data: r.data, uploadId: up.data.id });
     else sendJson(res, r.status || 500, { ok: false, error: (r.data && r.data.error) || 'daemon-error', status: r.status, step: 'send' });
+    return;
+  }
+
+  // Download an image a group member sent: GET /api/media?messageId=<id>
+  // [&quality=best|original|standard|thumbnail]. Returns JSON
+  // {ok:true, imageBase64, mimeType, quality} (base64 so any client can
+  // use it without handling binary bodies), or {ok:false, error}.
+  // The daemon's /messages/{id}/image needs the opaque message id from
+  // /api/messages (NOT the numeric localId). Max ~10 MB of image bytes.
+  if (p === '/api/media' && req.method === 'GET') {
+    const messageId = url.searchParams.get('messageId') || url.searchParams.get('id');
+    let quality = (url.searchParams.get('quality') || 'best').toLowerCase();
+    if (!['best', 'original', 'standard', 'thumbnail'].includes(quality)) quality = 'best';
+    if (!messageId) { sendJson(res, 400, { ok: false, error: 'messageId-required' }); return; }
+    const accountId = await getOrCreateAccount();
+    if (!accountId) { sendJson(res, 500, { ok: false, error: 'no-account' }); return; }
+    const img = await fetchMessageImage(accountId, messageId, quality);
+    if (!img.ok) { sendJson(res, 502, { ok: false, error: img.error || 'media-unavailable', status: img.status }); return; }
+    if (img.buf.length > 10 * 1024 * 1024) { sendJson(res, 502, { ok: false, error: 'image-too-large' }); return; }
+    sendJson(res, 200, { ok: true, imageBase64: img.buf.toString('base64'), mimeType: img.mimeType, quality: img.quality, byteLength: img.buf.length });
     return;
   }
 
