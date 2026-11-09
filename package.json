@@ -1,0 +1,1 @@
+{"description":"agent-wechat daemon (native WeChat protocol client) behind a tiny health proxy, for Render's free Web Service tier.","engines":{"node":">=24.16"},"name":"agent-wechat-render","private":true,"scripts":{"proxy":"node proxy.js","start":"bash start.sh"},"version":"1.0.0"}
