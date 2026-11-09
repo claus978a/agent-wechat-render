@@ -318,9 +318,19 @@ return;
 
 if (type === 3) {
 pushHistory(name, '[图片]');
-const img = await fetchImage(accountId, msg.id);
-if (!img.ok) {
-log(`image download failed (${name}): ${img.error}`);
+// The image may still be arriving when we first see the message, and
+// Render's free tier drops connections, so retry the whole download
+// a few times with waits before giving up.
+let img = null;
+for (let attempt = 0; attempt < 3; attempt++) {
+if (attempt === 0) await sleep(3000);
+else await sleep(5000);
+img = await fetchImage(accountId, msg.id);
+if (img.ok) break;
+log(`image download attempt ${attempt + 1} failed (${name}): ${img.error}`);
+}
+if (!img || !img.ok) {
+log(`image download failed (${name}): ${img ? img.error : 'unknown'}`);
 await sendText(accountId, IMAGE_FALLBACK);
 return;
 }
