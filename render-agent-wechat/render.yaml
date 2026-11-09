@@ -1,0 +1,14 @@
+# Render Blueprint for agent-wechat (free tier)
+# Optional: if you add this file to the repo, Render can create the service
+# from it (New -> Blueprint). Otherwise create the Web Service manually
+# (see README.md) — either way works.
+services:
+  - type: web
+    name: agent-wechat
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DAEMON_PORT
+        value: "6174"
